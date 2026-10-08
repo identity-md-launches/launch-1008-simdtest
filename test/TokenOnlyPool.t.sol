@@ -91,6 +91,9 @@ abstract contract TokenOnlyPoolScenarios is LaunchFixture {
         assertEq(hook.stakingFees(), staking);
         assertEq(imd.balanceOf(address(manager)), spent);
         assertEq(imd.balanceOf(address(hook)), 0);
+        // Alice staked in the block of the first buy, so its fee is queued until her stake matures.
+        assertEq(vault.earned(alice), 0);
+        vm.roll(block.number + 1);
         assertEq(vault.earned(alice), staking);
         _assertSettled();
 

@@ -44,7 +44,7 @@ contract VaultFailurePathsTest is Test {
     }
 
     function test_ZeroStakeAndUnstakeDoNotConsumePendingRewards() public {
-        _stake(alice, 50 ether);
+        _stakeAndMature(alice, 50 ether);
         source.accrue(20 ether);
         bytes32 state = _state(alice);
         vm.prank(alice);
@@ -58,7 +58,7 @@ contract VaultFailurePathsTest is Test {
     }
 
     function test_InsufficientAllowanceAndBalanceRollBackAccounting() public {
-        _stake(alice, 50 ether);
+        _stakeAndMature(alice, 50 ether);
         source.accrue(20 ether);
         vm.prank(bob);
         token.approve(address(vault), 0);
@@ -81,7 +81,7 @@ contract VaultFailurePathsTest is Test {
     }
 
     function test_OverWithdrawalAndStrangerCannotCheckpointOrTakeRewards() public {
-        _stake(alice, 50 ether);
+        _stakeAndMature(alice, 50 ether);
         source.accrue(20 ether);
         bytes32 state = _state(alice);
         vm.prank(alice);
@@ -98,8 +98,77 @@ contract VaultFailurePathsTest is Test {
         assertEq(vault.claim(), 20 ether);
     }
 
-    function test_NotificationsRequireBothAccrualAndFundingAndCannotReplay() public {
+    /// The limit counts a same-block (pending) stake and an eligible one together, and a stranger
+    /// cannot cancel somebody else's pending stake.
+    function test_SameBlockOverWithdrawalCountsPendingAndActiveTogether() public {
+        _stakeAndMature(alice, 50 ether);
+        _stake(alice, 30 ether);
+        assertEq(vault.activeOf(alice), 50 ether);
+        assertEq(vault.pendingOf(alice), 30 ether);
+        assertEq(vault.balanceOf(alice), 80 ether);
+        vm.prank(alice);
+        vm.expectRevert(SIMDTESTVault.InsufficientStake.selector);
+        vault.unstake(80 ether + 1);
+        vm.prank(bob);
+        vm.expectRevert(SIMDTESTVault.InsufficientStake.selector);
+        vault.unstake(1);
+        assertEq(vault.pendingStake(), 30 ether);
+        vm.prank(alice);
+        vault.unstake(80 ether);
+        assertEq(vault.totalStaked(), 0);
+        assertEq(vault.pendingStake(), 0);
+        assertEq(vault.activeStake(), 0);
+        assertEq(token.balanceOf(alice), 100 ether);
+    }
+
+    /// Fees that arrive while nothing is eligible wait for the first stake that survives its block.
+    /// A stake cancelled in its own block never qualifies, and cannot leave a stale bucket behind.
+    function test_CancelledPendingStakeEarnsNothingAndLeavesTheQueueToTheNextMaturedStake() public {
+        source.accrue(30 ether);
         _stake(alice, 50 ether);
+        source.accrue(20 ether);
+        vm.prank(alice);
+        vault.unstake(50 ether);
+        assertEq(vault.pendingStake(), 0);
+        vm.roll(block.number + 1);
+        assertEq(vault.earned(alice), 0);
+        vm.prank(alice);
+        assertEq(vault.claim(), 0);
+        _stake(bob, 1);
+        assertEq(vault.earned(bob), 0);
+        vm.roll(block.number + 1);
+        assertEq(vault.earned(alice), 0);
+        assertEq(vault.earned(bob), 50 ether);
+        vm.prank(bob);
+        assertEq(vault.claim(), 50 ether);
+        assertEq(vault.pending(), 0);
+        assertEq(token.balanceOf(alice), 100 ether);
+    }
+
+    /// Refilling a bucket that was emptied by cancellation in the same block must not confuse the
+    /// block boundary: fees of that block still go to the stake eligible before it.
+    function test_RefilledSameBlockBucketKeepsTheBoundaryExact() public {
+        _stakeAndMature(alice, 25 ether);
+        _stake(bob, 25 ether);
+        vm.prank(bob);
+        vault.unstake(25 ether);
+        source.accrue(10 ether); // Bob is out; Alice alone is eligible.
+        _stake(bob, 75 ether); // Same block, bucket refilled after an accrual.
+        source.accrue(20 ether); // Still Bob's stake block: Alice alone.
+        vm.roll(block.number + 1);
+        source.accrue(40 ether); // Shared 1:3.
+        vm.roll(block.number + 3);
+        assertEq(vault.earned(alice), 40 ether);
+        assertEq(vault.earned(bob), 30 ether);
+        vm.prank(bob);
+        assertEq(vault.claim(), 30 ether);
+        vm.prank(alice);
+        assertEq(vault.claim(), 40 ether);
+        assertEq(vault.pending(), 0);
+    }
+
+    function test_NotificationsRequireBothAccrualAndFundingAndCannotReplay() public {
+        _stakeAndMature(alice, 50 ether);
         source.accrue(10 ether);
         vm.expectRevert(SIMDTESTVault.OnlyHook.selector);
         vault.notifyReward(0);
@@ -124,6 +193,7 @@ contract VaultFailurePathsTest is Test {
     function test_DonationsDoNotCreateStakeOrDistributableRewards() public {
         _stake(alice, 20 ether);
         _stake(bob, 60 ether);
+        vm.roll(block.number + 1);
         source.accrue(40 ether);
         token.transfer(address(vault), 7 ether);
         reward.mint(address(vault), 11 ether);
@@ -154,6 +224,7 @@ contract VaultFailurePathsTest is Test {
         uint256 fee = bound(uint256(rewardSeed), 1, 1e24);
         _stake(alice, a);
         _stake(bob, b);
+        vm.roll(block.number + 1);
         source.accrue(fee);
         uint256 firstAlice = fee * a / (a + b);
         uint256 firstBob = fee * b / (a + b);
@@ -181,26 +252,70 @@ contract VaultFailurePathsTest is Test {
         assertEq(token.balanceOf(bob), 100 ether);
     }
 
+    /// A stake made in the block of an accrual takes none of it, whichever order the two happen in
+    /// and however many blocks pass before anyone touches the vault.
+    /// forge-config: default.fuzz.runs = 1000
+    function testFuzz_SameBlockStakeNeverTakesThatBlocksFees(
+        uint80 feeBefore,
+        uint80 feeAfter,
+        uint80 feeLater,
+        uint8 gapSeed,
+        bool touchBetween
+    ) public {
+        _stakeAndMature(alice, 25 ether);
+        uint256 before = bound(uint256(feeBefore), 0, 1e22);
+        uint256 after_ = bound(uint256(feeAfter), 0, 1e22);
+        uint256 later = bound(uint256(feeLater), 0, 1e22);
+        source.accrue(before);
+        _stake(bob, 75 ether);
+        source.accrue(after_);
+        if (touchBetween) source.sweep();
+        vm.roll(block.number + bound(uint256(gapSeed), 1, 50));
+        source.accrue(later);
+        assertEq(vault.earned(alice), before + after_ + later / 4, "alice");
+        assertEq(vault.earned(bob), later * 3 / 4, "bob");
+        vm.prank(bob);
+        assertEq(vault.claim(), later * 3 / 4);
+        vm.prank(alice);
+        assertEq(vault.claim(), before + after_ + later / 4);
+        assertLe(vault.pending(), 1);
+    }
+
     function _stake(address actor, uint256 amount) internal {
         vm.prank(actor);
         vault.stake(amount);
     }
 
+    function _stakeAndMature(address actor, uint256 amount) internal {
+        _stake(actor, amount);
+        vm.roll(block.number + 1);
+    }
+
     function _state(address actor) internal view returns (bytes32) {
-        return keccak256(
+        bytes32 global = keccak256(
             abi.encode(
                 vault.totalStaked(),
-                vault.balanceOf(actor),
+                vault.activeStake(),
+                vault.pendingStake(),
+                vault.pendingBlock(),
                 vault.rewardPerTokenStored(),
                 vault.accountedFees(),
-                vault.rewards(actor),
-                vault.userRewardPerTokenPaid(actor),
                 vault.scaledRemainder(),
-                vault.userRemainder(actor),
                 vault.queuedRewards(),
-                token.balanceOf(actor),
                 token.balanceOf(address(vault))
             )
         );
+        bytes32 account = keccak256(
+            abi.encode(
+                vault.balanceOf(actor),
+                vault.activeOf(actor),
+                vault.pendingOf(actor),
+                vault.rewards(actor),
+                vault.userRewardPerTokenPaid(actor),
+                vault.userRemainder(actor),
+                token.balanceOf(actor)
+            )
+        );
+        return keccak256(abi.encode(global, account));
     }
 }

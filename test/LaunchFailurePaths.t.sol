@@ -41,6 +41,7 @@ abstract contract LaunchFailureScenarios is LaunchFixture {
 
     function test_FailedClaimPaymentRollsBackItsNestedSweepAndCanRetry() public {
         _stake(alice, 100 ether);
+        vm.roll(block.number + 1); // A stake earns from the block after it is made.
         _swap(true, true, 1000 ether);
         bytes32 beforeState = _financialState();
         uint256 reward = vault.earned(alice);
@@ -63,9 +64,11 @@ abstract contract LaunchFailureScenarios is LaunchFixture {
 
     function test_FailedPrincipalTransfersPreserveStakeAndRewardCheckpoints() public {
         _stake(alice, 100 ether);
+        vm.roll(block.number + 1);
         _swap(true, true, 1000 ether);
         bytes32 beforeState = _financialState();
         uint256 earned = vault.earned(alice);
+        assertEq(earned, 10 ether);
         uint256 paid = vault.userRewardPerTokenPaid(alice);
         uint256 checkpoint = vault.rewardPerTokenStored();
         vm.mockCall(
