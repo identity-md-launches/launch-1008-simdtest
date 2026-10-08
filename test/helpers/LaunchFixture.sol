@@ -81,6 +81,10 @@ abstract contract LaunchFixture is Test {
         vm.prank(bob);
         token.approve(address(vault), type(uint256).max);
         manager.initialize(key, PRICE);
+        _seedLiquidity();
+    }
+
+    function _seedLiquidity() internal virtual {
         router.liquidity(key, 1_000_000 ether);
     }
 
