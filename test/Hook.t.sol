@@ -186,6 +186,13 @@ contract MainnetForkTest is HookScenarios {
     function setUp() public {
         _setup(true);
     }
+
+    /// forge-config: default.fuzz.runs = 1000
+    function testFuzz_MainnetSwapFees(bool buy, bool exactInput, uint96 amountSeed, uint8 blockSeed) public {
+        uint256 amount = bound(uint256(amountSeed), 100, 1000 ether);
+        vm.roll(hook.openingBlock() + bound(uint256(blockSeed), 0, 12));
+        _checkSwap(buy, exactInput, amount);
+    }
 }
 
 /// @dev Force both possible currency orderings, independent of Foundry's fixture deployment address.
