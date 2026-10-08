@@ -4,12 +4,21 @@ Date: 2026-10-08. Compiler: Solidity 0.8.26. Foundry: 1.8.3.
 
 The local deliverable implements the token, fee hook, staking vault, CREATE2 mining helper, vendored dependencies, test suites, deployment manifest, and operator documentation. No deployment, broadcast, funded wallet operation, owner configuration, or swarm allocation was performed.
 
+## Revision after independent review (2026-10-08)
+
+An independent reviewer on another machine reopened the accepted work with one high finding and three advisory ones. Each was reproduced locally before any change; the answers are recorded in `.imd-responses.json`.
+
+1. **Zero-duration staking recaptured the 1% staking fee (high, fixed).** The reviewer's proof flash-borrowed 500,000 pool-held SIMDTEST inside its own unlock, staked, bought 100,000 IMD, unstaked and repaid, then claimed 980.39 of the 1,000 IMD fee it had just paid. On the starting tree the proof failed exactly as reported. Repair: `SIMDTESTVault` now holds each stake as *pending* for the block it is made in and makes it eligible from the next block. `SIMDTESTHook._accrue` records `lastAccrualBlock` and `stakingFeesAtEndOf[block]` (the cumulative staking fee at the end of every block that accrued one), which lets the vault settle a stake block's fees to the stake that existed before it and share everything afterwards exactly, without any checkpoint between. Same-block stakes mature together; a pending stake can be cancelled by `unstake` in the same block, so principal remains withdrawable at any time. The vault's `totalStaked()` and `balanceOf` report pending plus eligible principal; `activeStake`, `pendingStake`, `activeOf`, `pendingOf` split them. The proof now passes (refund 0). New regressions: `test/JitStaking.t.sol` (in-unlock flash stake with borrowed pool tokens, same-block sandwich, exact block boundaries with and without intermediate checkpoints, pending cancellation) and `test/VaultAdversarial.t.sol` (`test_StakeEarnsOnlyFromTheNextBlock`, `test_LazyFlushDoesNotRobPassiveStakers`; the sequence fuzz now also rolls blocks). Existing tests that staked and swapped in one block now advance a block first.
+2. **One-sided liquidity exits pay no hook fee (low, disputed).** Reproduced in the sense that liquidity changes are not intercepted, as the README already stated. Liquidity provision is not a swap; the brief's fees are swap fees. Charging or refusing non-factory liquidity would need two more permission bits, a `$factory` allowlist the brief does not provide, and a different mined address. The boundary is now spelled out in the README.
+3. **Zero-staker queue goes to the first staker (info, disputed as policy).** Unchanged policy, still disclosed. The repair for item 1 means the queue goes to the first stakes that *mature*, so it can no longer be taken with tokens borrowed inside an unlock.
+4. **Atomic redemption strands the hackathon payout on a short IMD delivery (info, fixed).** `_redeem` now notifies the vault with the IMD balance the vault actually received (capped at the requested amount) instead of the requested amount. With a plain token nothing changes; with a shaving token the sweep completes and the hackathon stream is paid, and the shortfall lands on the stakers' last claims. `test_ShortDeliveryByIMDStillSweepsBothStreams` covers it.
+
 ## Final checks
 
 | Check | Result |
 | --- | --- |
 | `forge build` | Passed with the pinned compiler |
-| `forge test` | **44 passed, 0 failed, 1 skipped**, across ten suites |
+| `forge test` | **53 passed, 0 failed, 1 skipped**, across eleven suites (plus the reviewer's proof under `test/scratch/`, passing) |
 | `forge fmt --check` | Passed |
 | Stateful launch invariant | 128 runs × 64 actions = **8,192 calls, zero reverts** |
 | Isolated vault sequence fuzz | 512 runs × 150 interleaved actions |
@@ -44,8 +53,8 @@ An intermediate concurrent build exposed inconsistent embedded hook creation byt
 
 | Contract | Creation bytes | Runtime bytes |
 | --- | ---: | ---: |
-| SIMDTESTHook | 12,583 (+64 constructor bytes = **12,647**) | 6,976 |
-| SIMDTESTVault | 4,377 (+96 constructor bytes) | 3,984 |
+| SIMDTESTHook | 14,587 (+64 constructor bytes = **14,651**) | 7,448 |
+| SIMDTESTVault | 5,897 (+96 constructor bytes) | 5,483 |
 | SIMDTEST | 2,593 | 1,723 |
 
 The hook is below EIP-3860's 49,152-byte init-code limit, and all launch runtimes are below EIP-170's 24,576-byte limit. No external library linking is required.
@@ -64,4 +73,4 @@ Five public RPC endpoints returned HTTP 403 during read-only probes: PublicNode,
 
 The launch operator must also run the platform's manifest admission validator and full factory rehearsal, resolve the prescribed manager and freshly deployed token, mine the exact CREATE2 address, atomically deploy/initialize, fund liquidity, distribute the swarm allocation externally, and record the deployed vault. The factory's production liquidity/distributor implementation was not provided in this assignment and is not replaced by the test router.
 
-The README records the immutable economic policies that matter to participants: deployment-block fee clock, gross-IMD fee basis, separately rounded components, immediate reward eligibility, queued no-staker rewards awarded to the next first staker, and irrecoverable unsolicited donations. No unprovided private address, key, or contract ID has been invented.
+The README records the immutable economic policies that matter to participants: deployment-block fee clock, gross-IMD fee basis, separately rounded components, reward eligibility starting the block after staking (no lock, pending stakes cancellable), queued no-staker rewards awarded to the first stakes that mature, and irrecoverable unsolicited donations. No unprovided private address, key, or contract ID has been invented.

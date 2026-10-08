@@ -39,6 +39,11 @@ contract SIMDTESTHook is IUnlockCallback, ReentrancyGuard {
     uint256 public antiSnipeFees;
     uint256 public stakingFees;
     uint256 public totalStakingFees;
+    /// @notice Last block in which a fee accrued.
+    uint256 public lastAccrualBlock;
+    /// @notice Cumulative staking fees at the end of each block that accrued a fee and was followed
+    /// by another; lets the vault settle a block's fees to the stake that existed before that block.
+    mapping(uint256 => uint256) public stakingFeesAtEndOf;
     bool private sweepActive;
 
     error OnlyPoolManager();
@@ -59,6 +64,7 @@ contract SIMDTESTHook is IUnlockCallback, ReentrancyGuard {
         poolManager = manager_;
         token = token_;
         openingBlock = block.number;
+        lastAccrualBlock = block.number;
         bool pair0 = PAIRED_CURRENCY < address(token_);
         pairIsCurrency0 = pair0;
         PoolKey memory key = PoolKey({
@@ -175,8 +181,11 @@ contract SIMDTESTHook is IUnlockCallback, ReentrancyGuard {
         poolManager.burn(address(this), pair.toId(), anti + staking);
         if (anti != 0) poolManager.take(pair, HACKATHON_VAULT, anti);
         if (staking != 0) {
+            // Notify what the vault actually received, so a short delivery by the IMD token cannot
+            // revert the sweep and strand the hackathon payout with it.
+            uint256 before = IERC20(PAIRED_CURRENCY).balanceOf(address(vault));
             poolManager.take(pair, address(vault), staking);
-            vault.notifyReward(staking);
+            vault.notifyReward(Math.min(IERC20(PAIRED_CURRENCY).balanceOf(address(vault)) - before, staking));
         }
         emit Swept(anti, staking);
     }
@@ -216,6 +225,10 @@ contract SIMDTESTHook is IUnlockCallback, ReentrancyGuard {
     function _accrue(uint256 anti, uint256 staking) private returns (int128) {
         uint256 fee = anti + staking;
         if (fee != 0) {
+            if (block.number != lastAccrualBlock) {
+                stakingFeesAtEndOf[lastAccrualBlock] = totalStakingFees;
+                lastAccrualBlock = block.number;
+            }
             antiSnipeFees += anti;
             stakingFees += staking;
             totalStakingFees += staking;

@@ -16,16 +16,24 @@ contract VaultAuditToken is ERC20 {
 
 contract VaultAuditSource is ISIMDTESTFeeSource {
     uint256 public totalStakingFees;
+    uint256 public lastAccrualBlock;
+    mapping(uint256 => uint256) public stakingFeesAtEndOf;
     uint256 public swept;
     VaultAuditToken public reward;
     SIMDTESTVault public vault;
 
     constructor(VaultAuditToken stake, VaultAuditToken reward_) {
         reward = reward_;
+        lastAccrualBlock = block.number;
         vault = new SIMDTESTVault(stake, reward_, this);
     }
 
+    /// @dev Mirrors SIMDTESTHook._accrue, including the per-block boundary record.
     function accrue(uint256 value) external {
+        if (block.number != lastAccrualBlock) {
+            stakingFeesAtEndOf[lastAccrualBlock] = totalStakingFees;
+            lastAccrualBlock = block.number;
+        }
         totalStakingFees += value;
         reward.mint(address(this), value);
     }
@@ -73,11 +81,13 @@ contract VaultAdversarialTest is Test {
     function test_UnsweptRewardsBelongToPriorStakers() public {
         vm.prank(actors[0]);
         vault.stake(1000);
+        vm.roll(block.number + 1);
         source.accrue(2000);
         vm.prank(actors[1]);
         vault.stake(1000);
         assertEq(vault.earned(actors[0]), 2000);
         assertEq(vault.earned(actors[1]), 0);
+        vm.roll(block.number + 1);
         source.accrue(1000);
         vm.prank(actors[0]);
         vault.unstake(1000);
@@ -100,12 +110,15 @@ contract VaultAdversarialTest is Test {
         assertEq(vault.pending(), 99);
         vm.prank(actors[0]);
         vault.stake(1);
+        assertEq(vault.earned(actors[0]), 0);
+        vm.roll(block.number + 1);
         assertEq(vault.earned(actors[0]), 99);
         vm.prank(actors[0]);
         vault.unstake(1);
         source.accrue(11);
         vm.prank(actors[1]);
         vault.stake(100);
+        vm.roll(block.number + 1);
         assertEq(vault.earned(actors[1]), 11);
         vm.prank(actors[0]);
         vault.claim();
@@ -119,6 +132,7 @@ contract VaultAdversarialTest is Test {
         vault.stake(1);
         vm.prank(actors[1]);
         vault.stake(2);
+        vm.roll(block.number + 1);
         for (uint256 i; i < 3; i++) {
             source.accrue(1);
             vm.prank(actors[0]);
@@ -129,6 +143,52 @@ contract VaultAdversarialTest is Test {
         assertEq(reward.balanceOf(actors[0]), 1);
         assertEq(reward.balanceOf(actors[1]), 2);
         assertEq(vault.pending(), 0);
+    }
+
+    function test_StakeEarnsOnlyFromTheNextBlock() public {
+        vm.prank(actors[0]);
+        vault.stake(100);
+        vm.roll(block.number + 1);
+        vm.prank(actors[1]);
+        vault.stake(300); // Same block as the next accrual: not eligible for it.
+        source.accrue(1000);
+        assertEq(vault.earned(actors[0]), 1000);
+        assertEq(vault.earned(actors[1]), 0);
+        vm.prank(actors[1]);
+        vault.claim();
+        assertEq(reward.balanceOf(actors[1]), 0);
+        vm.roll(block.number + 1);
+        source.accrue(400); // Shared 1:3.
+        assertEq(vault.earned(actors[0]), 1100);
+        assertEq(vault.earned(actors[1]), 300);
+        vm.prank(actors[1]);
+        vault.unstake(300);
+        assertEq(vault.earned(actors[1]), 300);
+        vm.prank(actors[1]);
+        vault.claim();
+        assertEq(reward.balanceOf(actors[1]), 300);
+    }
+
+    function test_LazyFlushDoesNotRobPassiveStakers() public {
+        vm.prank(actors[0]);
+        vault.stake(100);
+        vm.roll(block.number + 1);
+        vm.prank(actors[1]);
+        vault.stake(100);
+        source.accrue(1000); // Stake block: all to actor 0.
+        vm.roll(block.number + 5);
+        source.accrue(500); // Shared.
+        vm.roll(block.number + 5);
+        source.accrue(500); // Shared.
+        vm.roll(block.number + 5);
+        assertEq(vault.earned(actors[0]), 1500);
+        assertEq(vault.earned(actors[1]), 500);
+        uint256 preview = vault.earned(actors[1]);
+        vm.prank(actors[1]);
+        vault.claim();
+        assertEq(reward.balanceOf(actors[1]), preview);
+        assertEq(vault.activeStake(), 200);
+        assertEq(vault.activationRewardPerToken(block.number - 15), 1000 * vault.SCALE() / 100);
     }
 
     function test_PrincipalCanOnlyBeWithdrawnByItsStaker() public {
@@ -148,9 +208,11 @@ contract VaultAdversarialTest is Test {
         for (uint256 step; step < 150; step++) {
             seed = uint256(keccak256(abi.encode(seed, step)));
             address actor = actors[seed % 4];
-            uint256 action = (seed >> 8) % 6;
+            uint256 action = (seed >> 8) % 7;
             uint256 amount = (seed >> 32) % 1e24 + 1;
-            if (action == 0) {
+            if (action == 6) {
+                vm.roll(block.number + 1 + (seed >> 200) % 3);
+            } else if (action == 0) {
                 source.accrue(amount);
             } else if (action == 1) {
                 source.sweep();

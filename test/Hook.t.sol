@@ -30,6 +30,7 @@ abstract contract HookScenarios is LaunchFixture {
 
     function test_SweepAnyCallerBothDestinationsRepeatedAndUnlocked() public {
         _stake(alice, 100 ether);
+        vm.roll(block.number + 1);
         _swap(true, true, 1000 ether);
         uint256 anti = hook.antiSnipeFees();
         uint256 staking = hook.stakingFees();

@@ -4,6 +4,7 @@ pragma solidity 0.8.26;
 import {LaunchFixture} from "./helpers/LaunchFixture.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {Currency} from "v4-core/src/types/Currency.sol";
+import {ShavingERC20} from "./mocks/ShavingERC20.sol";
 
 contract StakingIntegrationTest is LaunchFixture {
     function setUp() public {
@@ -12,10 +13,12 @@ contract StakingIntegrationTest is LaunchFixture {
 
     function test_JoinLeaveClaimBeforeAndAfterSweep() public {
         _stake(alice, 100 ether);
+        vm.roll(block.number + 1); // A stake earns from the block after it is made.
         _swap(true, true, 1000 ether); // 10 IMD for Alice, still held as claims.
         _stake(bob, 300 ether);
         assertEq(vault.earned(alice), 10 ether);
         assertEq(vault.earned(bob), 0);
+        vm.roll(block.number + 1);
         _swap(true, true, 2000 ether); // 5 Alice, 15 Bob.
         vm.prank(alice);
         vault.unstake(100 ether);
@@ -44,6 +47,7 @@ contract StakingIntegrationTest is LaunchFixture {
 
     function test_RewardTransferFailureRollsBackSweepButCannotLockPrincipal() public {
         _stake(alice, 100 ether);
+        vm.roll(block.number + 1);
         _swap(true, true, 1000 ether);
         uint256 anti = hook.antiSnipeFees();
         uint256 staking = hook.stakingFees();
@@ -64,16 +68,54 @@ contract StakingIntegrationTest is LaunchFixture {
         _assertSettled();
     }
 
+    /// A paired token that delivers less than requested must not strand the hackathon payout.
+    function test_ShortDeliveryByIMDStillSweepsBothStreams() public {
+        _stake(alice, 100 ether);
+        vm.roll(block.number + 1);
+        _swap(true, true, 1000 ether);
+        uint256 anti = hook.antiSnipeFees();
+        uint256 staking = hook.stakingFees();
+        assertGt(anti, 0);
+        assertEq(staking, 10 ether);
+        vm.etch(IMD, address(new ShavingERC20()).code);
+        hook.sweep();
+        assertEq(imd.balanceOf(hook.HACKATHON_VAULT()), anti - 1);
+        assertEq(imd.balanceOf(address(vault)), staking - 1);
+        assertEq(vault.totalNotified(), staking - 1);
+        assertEq(hook.antiSnipeFees() + hook.stakingFees(), 0);
+        // Rewards are still credited on accrued fees, so the shortfall lands on the last claim.
+        assertEq(vault.earned(alice), staking);
+        vm.prank(alice);
+        vm.expectRevert();
+        vault.claim();
+        vm.prank(alice);
+        vault.unstake(100 ether); // Principal is never affected.
+        assertEq(token.balanceOf(alice), 10_000 ether);
+        _assertSettled();
+    }
+
     function test_AccruedFeesBeforeFirstStakeAreQueued() public {
         _swap(true, true, 1000 ether);
         hook.sweep();
         assertEq(vault.queuedRewards(), 10 ether);
         _stake(alice, 1 ether);
+        assertEq(vault.earned(alice), 0); // Nothing until her stake matures in the next block.
+        vm.roll(block.number + 1);
+        assertEq(vault.earned(alice), 10 ether); // The queue goes to the first matured stake.
         _stake(bob, 1 ether);
         assertEq(vault.earned(alice), 10 ether);
         assertEq(vault.earned(bob), 0);
         vm.prank(alice);
         vault.claim();
         assertEq(imd.balanceOf(alice), 10 ether);
+    }
+
+    function test_SameBlockStakersShareTheQueueProRata() public {
+        _swap(true, true, 1000 ether);
+        _stake(alice, 1 ether);
+        _stake(bob, 3 ether);
+        vm.roll(block.number + 1);
+        assertEq(vault.earned(alice), 2.5 ether);
+        assertEq(vault.earned(bob), 7.5 ether);
     }
 }
